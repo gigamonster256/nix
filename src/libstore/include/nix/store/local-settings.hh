@@ -614,6 +614,10 @@ public:
           remove all ACLs from files and directories in the Nix store, but
           some ACLs like `security.selinux` or `system.nfs4_acl` can't be
           removed even by root. Therefore it's best to just ignore them.
+
+          Since an NFSv4 ACL can also govern the permission bits, Nix
+          rewrites `system.nfs4_acl` to match the canonical store
+          permissions where a `chmod` alone would not take effect.
         )"};
 #endif
 

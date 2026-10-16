@@ -3,6 +3,7 @@
 #include "nix/util/file-system.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/store-api.hh"
+#include "nix/util/file-system-at.hh"
 #include "nix/util/fs-sink.hh"
 
 #if NIX_SUPPORT_ACL
@@ -15,6 +16,105 @@ namespace nix {
 
 static constexpr time_t mtimeStore = 1; /* 1 second into the epoch */
 
+#if NIX_SUPPORT_ACL && defined(__linux__)
+
+/* Some filesystems keep permissions in a `system.nfs4_acl` ACL that cannot be
+   removed (it is listed in the default `ignored-acls`, so `stripXAttrs` skips
+   it) and whose `chmod` policy only *merges* mode changes. On such
+   filesystems chmod(2) can never clear the owner's write or execute bits, so
+   a freshly canonicalised store path ends up with the wrong mode. That
+   matters because the nar hash of a store path includes the executable bit:
+   such a path is reported as corrupted by `nix store verify` and cannot be
+   substituted from a binary cache.
+
+   Work around it by rewriting the ACL into a minimal, synthetic ACL that is
+   equivalent to the mode we want, which makes the mode bits authoritative
+   again. Only the special OWNER@/GROUP@/EVERYONE@ principals are used,
+   because named principals cannot be written while NFSv4 idmapping is
+   disabled (a common default). */
+static std::vector<char> makeSyntheticNfs4Acl(mode_t mode)
+{
+    /* ACE4_* access-mask bits, RFC 8881 §6.2.1. */
+    constexpr uint32_t ACE4_READ_DATA = 0x00000001;
+    constexpr uint32_t ACE4_WRITE_DATA = 0x00000002;
+    constexpr uint32_t ACE4_APPEND_DATA = 0x00000004;
+    constexpr uint32_t ACE4_EXECUTE = 0x00000020;
+    constexpr uint32_t ACE4_READ_ATTRIBUTES = 0x00000080;
+    constexpr uint32_t ACE4_WRITE_ATTRIBUTES = 0x00000100;
+    constexpr uint32_t ACE4_READ_ACL = 0x00020000;
+    constexpr uint32_t ACE4_WRITE_ACL = 0x00040000;
+    constexpr uint32_t ACE4_SYNCHRONIZE = 0x00100000;
+
+    auto maskFor = [](unsigned int rwx, bool owner) -> uint32_t {
+        uint32_t m = ACE4_READ_ACL | ACE4_SYNCHRONIZE;
+        if (rwx & 4)
+            m |= ACE4_READ_DATA | ACE4_READ_ATTRIBUTES;
+        if (rwx & 2)
+            m |= ACE4_WRITE_DATA | ACE4_APPEND_DATA | ACE4_WRITE_ATTRIBUTES | ACE4_WRITE_ACL;
+        if (rwx & 1)
+            m |= ACE4_EXECUTE;
+        /* Keep the owner able to set the modification time (Nix sets it to
+           1) and to chmod (so that the store can still be garbage
+           collected). Neither right affects the derived mode bits. */
+        if (owner)
+            m |= ACE4_WRITE_ATTRIBUTES | ACE4_WRITE_ACL;
+        return m;
+    };
+
+    struct Ace
+    {
+        std::string_view who;
+        uint32_t mask;
+    };
+    const Ace aces[] = {
+        {"OWNER@", maskFor((mode >> 6) & 7, true)},
+        {"GROUP@", maskFor((mode >> 3) & 7, false)},
+        {"EVERYONE@", maskFor(mode & 7, false)},
+    };
+
+    std::vector<char> buf;
+    auto put32 = [&](uint32_t v) {
+        buf.push_back(static_cast<char>(v >> 24));
+        buf.push_back(static_cast<char>(v >> 16));
+        buf.push_back(static_cast<char>(v >> 8));
+        buf.push_back(static_cast<char>(v));
+    };
+
+    put32(sizeof(aces) / sizeof(aces[0])); /* number of ACEs */
+    for (auto & ace : aces) {
+        put32(0);        /* ACE4_ACCESS_ALLOWED_ACE_TYPE */
+        put32(0);        /* flags */
+        put32(ace.mask); /* access mask */
+        put32(ace.who.size());
+        buf.insert(buf.end(), ace.who.begin(), ace.who.end());
+        while (buf.size() % 4 != 0) /* `who` is padded to a 4-byte boundary */
+            buf.push_back(0);
+    }
+
+    return buf;
+}
+
+static void setModeViaNfs4Acl(const std::filesystem::path & path, mode_t mode)
+{
+    auto acl = makeSyntheticNfs4Acl(mode & 0777);
+    if (::setxattr(path.c_str(), "system.nfs4_acl", acl.data(), acl.size(), 0) == -1)
+        throw SysError([&]() {
+            return HintFmt("setting permissions of %s through its NFSv4 ACL", PathFmt(path));
+        });
+}
+
+static void setModeViaNfs4Acl(Descriptor fd, mode_t mode)
+{
+    auto acl = makeSyntheticNfs4Acl(mode & 0777);
+    if (::fsetxattr(fd, "system.nfs4_acl", acl.data(), acl.size(), 0) == -1)
+        throw SysError([&]() {
+            return HintFmt(
+                "setting permissions of %s through its NFSv4 ACL", PathFmt(descriptorToPath(fd)));
+        });
+}
+
+#endif
+
 static void canonicaliseTimestampAndPermissions(const std::filesystem::path & path, const PosixStat & st)
 {
     if (!S_ISLNK(st.st_mode)) {
@@ -25,6 +125,13 @@ static void canonicaliseTimestampAndPermissions(const std::filesystem::path & pa
         if ((mode != 0444 || isDir) && mode != 0555) {
             mode = (st.st_mode & S_IFMT) | 0444 | (st.st_mode & S_IXUSR || isDir ? 0111 : 0);
             chmod(path, mode);
+#if NIX_SUPPORT_ACL && defined(__linux__)
+            /* A non-removable NFSv4 ACL can prevent chmod(2) from clearing
+               the owner's write/execute bits; re-apply the intended mode
+               through the ACL so that the store path hashes correctly. */
+            if ((lstat(path).st_mode & 0777) != (mode & 0777))
+                setModeViaNfs4Acl(path, mode);
+#endif
         }
     }
 
@@ -221,6 +328,11 @@ class CanonicalisingRestoreHooks : public RestoreSinkHooks
 #  endif
         if (::fchmod(fd, mode) == -1)
             throw SysError([&]() { return HintFmt("setting permissions on %s", PathFmt(descriptorToPath(fd))); });
+#  if NIX_SUPPORT_ACL && defined(__linux__)
+        /* See the comment above `makeSyntheticNfs4Acl`. */
+        if ((nix::fstat(fd).st_mode & 0777) != (mode & 0777))
+            setModeViaNfs4Acl(fd, mode);
+#  endif
         setStoreWriteTime(fd);
 #endif
     }
